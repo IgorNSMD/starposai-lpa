@@ -1,0 +1,24 @@
+appId: com.starposai.lpa
+productName: Starposai Local Print Agent
+directories:
+  output: dist
+  buildResources: build
+files:
+  - "src/**/*"
+  - "package.json"
+extraResources:
+  - from: assets
+    to: assets
+win:
+  target:
+    - nsis
+  artifactName: Starposai-LPA-Setup-${version}.exe
+nsis:
+  oneClick: true
+  perMachine: false
+  allowElevation: true
+  runAfterFinish: true
+publish:
+  provider: github
+  owner: TU_USUARIO_O_ORG
+  repo: starposai-lpa

@@ -1,0 +1,13 @@
+# dependencies
+/node_modules
+# build artifacts
+dist/
+out/
+release/
+*.exe
+*.msi
+*.dmg
+*.zip
+*.7z
+*.blockmap
+latest*.yml
