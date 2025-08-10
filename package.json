@@ -4,7 +4,7 @@
   "description": "Local Print Agent para STARPOSAI (Electron + auto-update)",
   "private": true,
 
-  "main": "src/scripts/main.js",
+  "main": "src/main.js",
 
   "scripts": {
     "dev": "concurrently -k \"npm:serve\" \"npm:electron\"",
