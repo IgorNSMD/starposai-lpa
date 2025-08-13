@@ -30,3 +30,4 @@ publish:
   provider: github
   owner: IgorNSMD
   repo: starposai-lpa
+  releaseType: release   # <-- agrega esta línea

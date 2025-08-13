@@ -1,6 +1,6 @@
 {
   "name": "starposai-lpa",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Local Print Agent para STARPOSAI (Electron + auto-update)",
   "private": true,
 
@@ -14,7 +14,8 @@
     "dist": "electron-builder",
     "publish": "electron-builder --publish always",
     "list:printers": "node list-printers.js",
-    "test:print": "node test-print.js \"Impresora Ticket 80mm (Ficticia)\" 1"
+    "test:print": "node test-print.js \"Impresora Ticket 80mm (Ficticia)\" 1",
+    "test-default-printer": "node test-default-printer.js"
   },
 
   "keywords": [],
