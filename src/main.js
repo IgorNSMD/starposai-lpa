@@ -238,7 +238,7 @@ function setupAutoUpdate() {
   autoUpdater.checkForUpdatesAndNotify();
   autoUpdater.on('update-downloaded', () => {
     // Se aplicará al reiniciar; puedes forzar reinicio:
-    // autoUpdater.quitAndInstall();
+    autoUpdater.quitAndInstall();
   });
 }
 
