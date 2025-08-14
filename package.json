@@ -1,6 +1,6 @@
 {
   "name": "starposai-lpa",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Local Print Agent para STARPOSAI (Electron + auto-update)",
   "private": true,
 

@@ -4,11 +4,28 @@ const log = require('electron-log');
 const { autoUpdater } = require('electron-updater');
 const express = require('express');
 const cors = require('cors');
+const { execFile } = require('child_process');
 
 const PORT = 9723;
 const ORIGINS = ['http://localhost:5173', 'http://127.0.0.1:5173', 'https://tu-dominio.netlify.app'];
 
 let mainWin; // opcional, ventana oculta para imprimir
+
+// Fallback: nombre de impresora predeterminada de Windows (por usuario actual)
+function getWindowsDefaultPrinterName() {
+  return new Promise((resolve) => {
+    const ps = [
+      '-NoProfile',
+      '-Command',
+      '(Get-CimInstance Win32_Printer | Where-Object {$_.Default -eq $true} | Select-Object -First 1 -ExpandProperty Name)'
+    ];
+    execFile('powershell.exe', ps, { windowsHide: true }, (err, stdout) => {
+      if (err) return resolve(null);
+      const name = String(stdout || '').trim();
+      resolve(name || null);
+    });
+  });
+}
 
 function createHiddenWindow() {
   mainWin = new BrowserWindow({
@@ -185,7 +202,18 @@ function setupServer() {
         return res.status(404).json({ error: 'No printers found' });
       }
 
-      const def = printers.find(p => p.isDefault) || printers[0];
+      // 1) Intenta con el flag de Electron
+      let def = printers.find(p => p.isDefault);
+
+      // 2) Fallback a Windows si no hay flag
+      if (!def) {
+        const winDef = await getWindowsDefaultPrinterName();
+        if (winDef) def = printers.find(p => p.name === winDef) || def;
+      }
+
+      // 3) Último recurso: primera de la lista
+      def = def || printers[0];
+
       const paperInfo = extractPaperInfoFromOptions(def.options || {});
       const guessWidthMm = guessThermalWidthMm(def.name, paperInfo);
 
@@ -204,7 +232,7 @@ function setupServer() {
 
       res.json({
         name: def.name,
-        isDefault: !!def.isDefault,
+        isDefault: !!def.isDefault, // puede ser false si vino por fallback
         status: def.status ?? null,
         description: def.description ?? null,
         paper: {
@@ -225,6 +253,7 @@ function setupServer() {
       res.status(500).send(String(e));
     }
   });
+
 
   // (Opcional) abrir cajón por ESC/POS si la impresora es de red TCP/9100.
   // appx.post('/open-drawer', async (req, res) => { ... });
