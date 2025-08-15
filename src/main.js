@@ -1,3 +1,4 @@
+// main.js
 const { app, BrowserWindow, Menu } = require('electron');
 const path = require('path');
 const log = require('electron-log');
@@ -6,20 +7,54 @@ const express = require('express');
 const cors = require('cors');
 const { execFile } = require('child_process');
 
+// ------------------------------
+// CONFIGURACIÓN BÁSICA
+// ------------------------------
 const PORT = 9723;
-const ORIGINS = ['http://localhost:5173', 'http://127.0.0.1:5173', 'https://tu-dominio.netlify.app'];
 
-let mainWin; // opcional, ventana oculta para imprimir
+// Permitir tu frontend en dev y (si quieres) dominios productivos.
+// Agrega aquí tus orígenes reales cuando pases a producción.
+const ALLOWED_ORIGINS = new Set([
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  // 'https://tu-dominio.netlify.app',
+]);
 
-// Fallback: nombre de impresora predeterminada de Windows (por usuario actual)
+// Si quieres proteger con un token, define STARPOSAI_LPA_TOKEN en la máquina
+// (Panel de Control → Variables de entorno) y el cliente debe enviar X-LPA-Token.
+const API_TOKEN = process.env.STARPOSAI_LPA_TOKEN || null;
+
+// ------------------------------
+// INFRA ELECTRON
+// ------------------------------
+let hiddenWin = null;
+
+function createHiddenWindow() {
+  hiddenWin = new BrowserWindow({
+    show: false,
+    webPreferences: { sandbox: false },
+  });
+  hiddenWin.on('closed', () => (hiddenWin = null));
+}
+
+// Asegura una ventana para poder invocar webContents.getPrintersAsync()
+function ensureWindow() {
+  let w = hiddenWin || BrowserWindow.getAllWindows()[0];
+  if (!w) {
+    w = new BrowserWindow({ show: false, webPreferences: { sandbox: false } });
+  }
+  return w;
+}
+
+// Predeterminada de Windows (por usuario actual) via PowerShell (fallback)
 function getWindowsDefaultPrinterName() {
   return new Promise((resolve) => {
-    const ps = [
+    const psArgs = [
       '-NoProfile',
       '-Command',
-      '(Get-CimInstance Win32_Printer | Where-Object {$_.Default -eq $true} | Select-Object -First 1 -ExpandProperty Name)'
+      '(Get-CimInstance Win32_Printer | Where-Object {$_.Default -eq $true} | Select-Object -First 1 -ExpandProperty Name)',
     ];
-    execFile('powershell.exe', ps, { windowsHide: true }, (err, stdout) => {
+    execFile('powershell.exe', psArgs, { windowsHide: true }, (err, stdout) => {
       if (err) return resolve(null);
       const name = String(stdout || '').trim();
       resolve(name || null);
@@ -27,29 +62,9 @@ function getWindowsDefaultPrinterName() {
   });
 }
 
-function createHiddenWindow() {
-  mainWin = new BrowserWindow({
-    show: false,
-    webPreferences: { sandbox: false }
-  });
-  mainWin.on('closed', () => { mainWin = null; });
-}
-
-// --- NUEVO: asegurar una ventana para getPrintersAsync
-function ensureWindow() {
-  let w = mainWin || BrowserWindow.getAllWindows()[0];
-  if (!w) {
-    w = new BrowserWindow({ show: false, webPreferences: { sandbox: false } });
-  }
-  return w;
-}
-
-// --- NUEVO: extraer info de papel desde options del driver (best effort)
+// Estimar ancho térmico por nombre/opciones
 function extractPaperInfoFromOptions(opts = {}) {
-  const out = {
-    from: [],
-    rawKeys: Object.keys(opts || {}),
-  };
+  const out = { from: [], rawKeys: Object.keys(opts || {}) };
 
   if (Array.isArray(opts.papers)) {
     for (const p of opts.papers) {
@@ -74,27 +89,23 @@ function extractPaperInfoFromOptions(opts = {}) {
     });
   }
 
-  const maybeSizeStrings = []
+  const maybeStrings = []
     .concat(opts.pageSize || [])
     .concat(opts.media || [])
     .concat(opts.customPaperSize || [])
     .concat(opts.paper || []);
 
-  for (const entry of maybeSizeStrings) {
+  for (const entry of maybeStrings) {
     if (!entry) continue;
     const s = String(entry);
-    const mmMatch = s.match(/(\d+(?:\.\d+)?)\s*mm/i);
-    if (mmMatch) {
-      out.from.push({ name: s, widthMm: Number(mmMatch[1]) });
-    } else {
-      out.from.push({ name: s });
-    }
+    const mm = s.match(/(\d+(?:\.\d+)?)\s*mm/i);
+    if (mm) out.from.push({ name: s, widthMm: Number(mm[1]) });
+    else out.from.push({ name: s });
   }
 
   return out;
 }
 
-// --- NUEVO: estimar ancho del rollo térmico (58/80mm) por nombre/opciones
 function guessThermalWidthMm(printerName, paperInfo) {
   const name = (printerName || '').toLowerCase();
   if (name.includes('80') || name.includes('t20') || name.includes('tm-t20') || name.includes('t88')) return 80;
@@ -108,81 +119,72 @@ function guessThermalWidthMm(printerName, paperInfo) {
     if (p.widthMm && p.widthMm >= 75 && p.widthMm <= 85) return 80;
     if (p.widthMm && p.widthMm >= 55 && p.widthMm <= 60) return 58;
   }
-  return 80; // default más común
+  return 80; // default razonable
 }
 
-async function printHTMLSilent(html, deviceName, copies = 1) {
-  const win = new BrowserWindow({ show: false });
-  await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
-  for (let i = 0; i < copies; i++) {
+// Impresión HTML silenciosa
+async function printHTMLSilent(html, deviceName, copies = 1, widthMm = 80) {
+  const win = new BrowserWindow({ show: false, webPreferences: { sandbox: false } });
+  const pageCss = `
+    <style>
+      @media print { @page { size: ${widthMm}mm auto; margin: 0 } body { width: ${widthMm}mm; margin:0 } }
+      body { font-family: monospace; font-size: 12px; }
+    </style>`;
+
+  await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(
+    `<!doctype html><html><head><meta charset="utf-8">${pageCss}</head><body>${html}</body></html>`
+  ));
+
+  for (let i = 0; i < Math.max(1, Number(copies) || 1); i += 1) {
+    // Nota: en Windows `deviceName` debe ser el name exacto
     await win.webContents.print({ silent: true, deviceName });
   }
   await win.destroy();
 }
 
-function listPrinters() {
-  const w = ensureWindow();
-  return w.webContents.getPrintersAsync();
-}
-
+// ------------------------------
+// API HTTP (Express)
+// ------------------------------
 function setupServer() {
-  const appx = express();
-  appx.use(express.json({ limit: '2mb' }));
-  appx.use(cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (ORIGINS.includes(origin)) return cb(null, true);
-      return cb(null, true); // restringe aquí si quieres
-    }
-  }));
+  const srv = express();
 
-  // Seguridad simple opcional por API Key
-  appx.use((req, res, next) => {
-    const key = req.header('X-API-Key') || '';
-    // TODO: valida contra un valor guardado en un archivo config local
-    return next();
+  srv.use(express.json({ limit: '2mb' }));
+  srv.use(
+    cors({
+      origin: (origin, cb) => {
+        if (!origin) return cb(null, true); // requests locales (fetch desde file/insomnia)
+        if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
+        // Si quieres bloquear estrictamente, usa: return cb(new Error('Origen no permitido'));
+        return cb(null, true);
+      },
+    })
+  );
+
+  // Token simple opcional
+  srv.use((req, res, next) => {
+    if (!API_TOKEN) return next();
+    const token = req.header('X-LPA-Token');
+    if (token === API_TOKEN) return next();
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
   });
 
-  // --- EXISTENTES
-  appx.get('/health', (req, res) => res.json({ ok: true, version: app.getVersion() }));
+  // Salud
+  srv.get('/health', (_req, res) => res.json({ ok: true, version: app.getVersion() }));
 
-  appx.get('/printers', async (req, res) => {
+  // Solo nombres
+  srv.get('/printers', async (_req, res) => {
     try {
-      const list = await listPrinters();
-      res.json(list.map(p => p.name));
+      const w = ensureWindow();
+      const list = await w.webContents.getPrintersAsync();
+      res.json(list.map((p) => p.name));
     } catch (e) {
       log.error(e);
       res.status(500).send(String(e));
     }
   });
 
-  appx.post('/print', async (req, res) => {
-    try {
-      const { printerName, html, copies = 1 } = req.body;
-      if (!html) return res.status(400).send('html requerido');
-
-      const pageCss = `
-        <style>
-          @media print { @page { size: 80mm auto; margin: 0 } body { width: 80mm; margin:0 } }
-          body { font-family: monospace; font-size: 12px; }
-        </style>`;
-
-      await printHTMLSilent(
-        `<!doctype html><html><head>${pageCss}</head><body>${html}</body></html>`,
-        printerName,
-        copies
-      );
-      res.json({ ok: true });
-    } catch (e) {
-      log.error(e);
-      res.status(500).send(String(e));
-    }
-  });
-
-  // --- NUEVOS ENDPOINTS
-
-  // Dump completo de impresoras (para depurar drivers/opciones)
-  appx.get('/printers/detail', async (req, res) => {
+  // Dump completo (depuración)
+  srv.get('/printers/detail', async (_req, res) => {
     try {
       const w = ensureWindow();
       const printers = await w.webContents.getPrintersAsync();
@@ -193,25 +195,23 @@ function setupServer() {
     }
   });
 
-  // Impresora por defecto + info de papel y ancho estimado
-  appx.get('/default-printer', async (req, res) => {
+  // Predeterminada + info de papel
+  srv.get('/default-printer', async (_req, res) => {
     try {
       const w = ensureWindow();
       const printers = await w.webContents.getPrintersAsync();
+
       if (!Array.isArray(printers) || printers.length === 0) {
-        return res.status(404).json({ error: 'No printers found' });
+        return res.status(404).json({ error: 'no_printers' });
       }
 
-      // 1) Intenta con el flag de Electron
-      let def = printers.find(p => p.isDefault);
+      let def = printers.find((p) => p.isDefault);
 
-      // 2) Fallback a Windows si no hay flag
       if (!def) {
         const winDef = await getWindowsDefaultPrinterName();
-        if (winDef) def = printers.find(p => p.name === winDef) || def;
+        if (winDef) def = printers.find((p) => p.name === winDef) || def;
       }
 
-      // 3) Último recurso: primera de la lista
       def = def || printers[0];
 
       const paperInfo = extractPaperInfoFromOptions(def.options || {});
@@ -219,7 +219,9 @@ function setupServer() {
 
       let reportedWidthMm = null;
       let reportedHeightMm = null;
-      const candidate = paperInfo.from.find(p => typeof p.widthMm === 'number' || (p.width && p.height));
+      const candidate = paperInfo.from.find(
+        (p) => typeof p.widthMm === 'number' || (p.width && p.height)
+      );
       if (candidate) {
         if (typeof candidate.widthMm === 'number') {
           reportedWidthMm = candidate.widthMm;
@@ -232,21 +234,21 @@ function setupServer() {
 
       res.json({
         name: def.name,
-        isDefault: !!def.isDefault, // puede ser false si vino por fallback
+        isDefault: Boolean(def.isDefault), // puede venir false si se resolvió por fallback
         status: def.status ?? null,
-        description: def.description ?? null,
+        description: def.description ?? '',
         paper: {
           reportedWidthMm,
           reportedHeightMm,
           guessWidthMm,
           sources: paperInfo.from,
-          rawKeys: paperInfo.rawKeys
+          rawKeys: paperInfo.rawKeys,
         },
         raw: {
           name: def.name,
           isDefault: def.isDefault,
           options: def.options || {},
-        }
+        },
       });
     } catch (e) {
       log.error(e);
@@ -254,31 +256,59 @@ function setupServer() {
     }
   });
 
+  // Imprimir HTML
+  srv.post('/print', async (req, res) => {
+    try {
+      const { printerName, html, copies = 1, widthMm } = req.body || {};
+      if (!html) return res.status(400).json({ ok: false, error: 'html_required' });
+      if (!printerName) return res.status(400).json({ ok: false, error: 'printer_required' });
 
-  // (Opcional) abrir cajón por ESC/POS si la impresora es de red TCP/9100.
-  // appx.post('/open-drawer', async (req, res) => { ... });
+      const w = ensureWindow();
+      // (opcional) podrías validar que la impresora exista:
+      // const names = (await w.webContents.getPrintersAsync()).map(p => p.name);
+      // if (!names.includes(printerName)) return res.status(404).json({ ok: false, error: 'printer_not_found' });
 
-  appx.listen(PORT, '127.0.0.1', () => log.info(`LPA listening on http://127.0.0.1:${PORT}`));
+      await printHTMLSilent(html, printerName, copies, Number(widthMm) || 80);
+      res.json({ ok: true });
+    } catch (e) {
+      log.error(e);
+      res.status(500).json({ ok: false, error: String(e) });
+    }
+  });
+
+  srv.listen(PORT, '127.0.0.1', () => log.info(`LPA listening on http://127.0.0.1:${PORT}`));
 }
 
+// ------------------------------
+// AUTO-UPDATE
+// ------------------------------
 function setupAutoUpdate() {
   autoUpdater.logger = log;
   autoUpdater.logger.transports.file.level = 'info';
+
+  // Descarga y notifica. Cuando termine de bajar, instala y reinicia.
   autoUpdater.checkForUpdatesAndNotify();
   autoUpdater.on('update-downloaded', () => {
-    // Se aplicará al reiniciar; puedes forzar reinicio:
-    autoUpdater.quitAndInstall();
+    try {
+      autoUpdater.quitAndInstall(); // instala y reinicia
+    } catch (e) {
+      log.error('quitAndInstall failed:', e);
+    }
   });
 }
 
-app.whenReady().then(async () => {
-  Menu.setApplicationMenu(null);
+// ------------------------------
+// CICLO DE VIDA APP
+// ------------------------------
+app.whenReady().then(() => {
+  Menu.setApplicationMenu(null); // sin menú
   createHiddenWindow();
   setupServer();
   setupAutoUpdate();
+
+  // Iniciar con Windows (por usuario actual)
   app.setLoginItemSettings({ openAtLogin: true });
 });
 
-app.on('window-all-closed', (e) => {
-  e.preventDefault(); // Mantener residente aunque no haya ventanas
-});
+// Mantener residente aunque se cierren ventanas
+app.on('window-all-closed', (e) => e.preventDefault());
