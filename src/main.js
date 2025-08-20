@@ -123,11 +123,14 @@ function guessThermalWidthMm(printerName, paperInfo) {
 }
 
 // Impresión HTML silenciosa
+// Reemplaza toda la función por esta versión
 async function printHTMLSilent(html, deviceName, copies = 1, widthMm = 80) {
   const win = new BrowserWindow({ show: false, webPreferences: { sandbox: false } });
+
   const pageCss = `
     <style>
-      @media print { @page { size: ${widthMm}mm auto; margin: 0 } body { width: ${widthMm}mm; margin:0 } }
+      @media print { @page { size: ${widthMm}mm auto; margin: 0 }
+        body { width: ${widthMm}mm; margin:0 } }
       body { font-family: monospace; font-size: 12px; }
     </style>`;
 
@@ -135,12 +138,26 @@ async function printHTMLSilent(html, deviceName, copies = 1, widthMm = 80) {
     `<!doctype html><html><head><meta charset="utf-8">${pageCss}</head><body>${html}</body></html>`
   ));
 
-  for (let i = 0; i < Math.max(1, Number(copies) || 1); i += 1) {
-    // Nota: en Windows `deviceName` debe ser el name exacto
-    await win.webContents.print({ silent: true, deviceName });
+  const doPrintOnce = () =>
+    new Promise((resolve, reject) => {
+      // IMPORTANTE: usar callback; agregar printBackground mejora consistencia
+      win.webContents.print(
+        { silent: true, deviceName, printBackground: true },
+        (success, failureReason) => {
+          if (!success) return reject(new Error(failureReason || 'print_failed'));
+          resolve();
+        }
+      );
+    });
+
+  const n = Math.max(1, Number(copies) || 1);
+  for (let i = 0; i < n; i += 1) {
+    await doPrintOnce();
   }
-  await win.destroy();
+
+  win.destroy(); // no es async
 }
+
 
 // ------------------------------
 // API HTTP (Express)
