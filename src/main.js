@@ -277,64 +277,87 @@ function setupServer() {
   });
 
   // Imprimir ticket de PRUEBA (HTML)
-  srv.post('/print/test', async (req, res) => {
-    try {
-      const { printerName, copies = 1, widthMm } = req.body || {};
+  // ===== Test print (GET: imprime 1 copia en la predeterminada) =====
+srv.get('/print/test', async (_req, res) => {
+  try {
+    const w = ensureWindow();
+    const printers = await w.webContents.getPrintersAsync();
 
-      // 1) Obtener lista de impresoras y resolver target
-      const w = ensureWindow();
-      const printers = await w.webContents.getPrintersAsync();
-
-      if (!Array.isArray(printers) || printers.length === 0) {
-        return res.status(404).json({ ok: false, error: 'no_printers' });
-      }
-
-      let target =
-        printerName ||
-        printers.find((p) => p.isDefault)?.name ||
-        (await getWindowsDefaultPrinterName()) ||
-        printers[0]?.name;
-
-      if (!target) {
-        return res.status(404).json({ ok: false, error: 'no_printer_selected' });
-      }
-
-      // 2) Calcular ancho térmico sugerido (58/80) si no viene forzado
-      const selected = printers.find((p) => p.name === target) || printers[0];
-      const paperInfo = extractPaperInfoFromOptions((selected && selected.options) || {});
-      const finalWidth = Number(widthMm) || guessThermalWidthMm(target, paperInfo);
-
-      // 3) HTML demo simple (monospace) con @page para ajustarse a 58/80 mm
-      const demoHtml = `
-        <div style="font-family:monospace">
-          <div style="text-align:center;">
-            <h3 style="margin:4px 0">STARPOSAI</h3>
-            <div>TEST TICKET (LPA)</div>
-            <div>${new Date().toLocaleString()}</div>
-            <hr/>
-          </div>
-          <div>Producto A x1 ............. $1.000</div>
-          <div>Producto B x2 ............. $3.000</div>
-          <div>--------------------------------</div>
-          <div><b>TOTAL</b> ................. <b>$4.000</b></div>
-          <div style="text-align:center;margin-top:8px">¡Gracias por su compra!</div>
-        </div>
-      `;
-
-      // 4) Imprimir en silencio
-      await printHTMLSilent(demoHtml, target, Number(copies) || 1, finalWidth);
-
-      return res.json({
-        ok: true,
-        printer: target,
-        widthMm: finalWidth,
-        copies: Number(copies) || 1,
-      });
-    } catch (e) {
-      log.error(e);
-      return res.status(500).json({ ok: false, error: String(e) });
+    if (!Array.isArray(printers) || printers.length === 0) {
+      return res.status(404).json({ ok: false, error: 'no_printers' });
     }
-  });
+
+    // Elegir predeterminada (o fallback a la primera disponible)
+    let target = printers.find(p => p.isDefault)?.name || printers[0].name;
+
+    // Calcular ancho sugerido (58/80 mm) usando tus utilidades
+    const selected = printers.find(p => p.name === target) || printers[0];
+    const paperInfo = extractPaperInfoFromOptions((selected && selected.options) || {});
+    const finalWidth = guessThermalWidthMm(target, paperInfo);
+
+    // HTML demo (monospace) – se imprime en silencio
+    const demoHtml = `
+      <div style="font-family:monospace">
+        <div style="text-align:center;">
+          <h3 style="margin:4px 0">STARPOSAI</h3>
+          <div>TEST TICKET</div>
+          <div>${new Date().toLocaleString()}</div>
+          <hr/>
+        </div>
+        <div>Producto A x1 ............. $1.000</div>
+        <div>Producto B x2 ............. $3.000</div>
+        <div>--------------------------------</div>
+        <div><b>TOTAL</b> ................. <b>$4.000</b></div>
+        <div style="text-align:center;margin-top:8px">¡Gracias por su compra!</div>
+      </div>
+    `;
+
+    await printHTMLSilent(demoHtml, target, 1, finalWidth); // usa tu función actual
+    return res.json({ ok: true, printer: target, widthMm: finalWidth, copies: 1 });
+  } catch (e) {
+    log.error(e);
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// ===== Test print (POST: permite opciones) =====
+srv.post('/print/test', async (req, res) => {
+  try {
+    const { printerName, copies = 1, widthMm } = req.body || {};
+
+    const w = ensureWindow();
+    const printers = await w.webContents.getPrintersAsync();
+    if (!Array.isArray(printers) || printers.length === 0) {
+      return res.status(404).json({ ok: false, error: 'no_printers' });
+    }
+
+    let target = printerName || printers.find(p => p.isDefault)?.name || printers[0].name;
+
+    const selected = printers.find(p => p.name === target) || printers[0];
+    const paperInfo = extractPaperInfoFromOptions((selected && selected.options) || {});
+    const finalWidth = Number(widthMm) || guessThermalWidthMm(target, paperInfo);
+
+    const demoHtml = `
+      <div style="font-family:monospace">
+        <div style="text-align:center;">
+          <h3 style="margin:4px 0">STARPOSAI</h3>
+          <div>TEST TICKET</div>
+          <div>${new Date().toLocaleString()}</div>
+          <hr/>
+        </div>
+        <div>Item demo ................. $1.000</div>
+        <div><b>TOTAL</b> ................. <b>$1.000</b></div>
+      </div>
+    `;
+
+    await printHTMLSilent(demoHtml, target, Number(copies) || 1, finalWidth);
+    return res.json({ ok: true, printer: target, widthMm: finalWidth, copies: Number(copies) || 1 });
+  } catch (e) {
+    log.error(e);
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
 
 
   srv.listen(PORT, '127.0.0.1', () => log.info(`LPA listening on http://127.0.0.1:${PORT}`));
