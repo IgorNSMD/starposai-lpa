@@ -424,6 +424,65 @@ function setupServer() {
     }
   });
 
+  // Abre cajón con ESC p, con opción de simulación
+  srv.post('/cash/open', async (req, res) => {
+    try {
+      const { printerName, pin = 0, on = 50, off = 200, simulate = false } = req.body || {};
+
+      // Si simulamos, no tocamos spooler: dejamos "huellas" comprobables
+      if (simulate) {
+        const fs = require('fs');
+        const path = require('path');
+        const { app } = require('electron');
+
+        const dir = path.join(app.getPath('downloads'), 'STARPOSAI');
+        fs.mkdirSync(dir, { recursive: true });
+        const file = path.join(dir, `drawer-sim-${Date.now()}.txt`);
+        fs.writeFileSync(file, `SIMULATED CASH DRAWER OPEN\npin=${pin} on=${on} off=${off}\n`);
+
+        // (Opcional) Notificación Windows
+        try {
+          const { exec } = require('child_process');
+          exec(`powershell -NoProfile -Command "New-BurntToastNotification -Text 'STARPOSAI', 'Simulación: Cajón abierto'"`);
+        } catch { /* no crítico */ }
+
+        return res.json({ ok: true, simulated: true, file, pin, on, off });
+      }
+
+      // --- Modo real: enviar ESC p ---
+      const w = ensureWindow();
+      const printers = await w.webContents.getPrintersAsync();
+      if (!Array.isArray(printers) || printers.length === 0) {
+        return res.status(404).json({ ok: false, error: 'no_printers' });
+      }
+
+      const target =
+        printerName ||
+        printers.find((p) => p.isDefault)?.name ||
+        (await getWindowsDefaultPrinterName()) ||
+        printers[0].name;
+
+      const data = Buffer.from([0x1B, 0x70, Number(pin)||0, Number(on)||50, Number(off)||200]);
+
+      const fs = require('fs');
+      const os = require('os');
+      const path = require('path');
+      const { exec } = require('child_process');
+
+      const tmpFile = path.join(os.tmpdir(), `lpa-cash-${Date.now()}.bin`);
+      fs.writeFileSync(tmpFile, data);
+
+      exec(`print /D:"${target}" "${tmpFile}"`, (err) => {
+        fs.unlink(tmpFile, () => {});
+        if (err) return res.status(500).json({ ok: false, error: String(err) });
+        res.json({ ok: true, simulated: false, printer: target, pin: Number(pin)||0, on: Number(on)||50, off: Number(off)||200 });
+      });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
+  });
+
+
 
   srv.listen(PORT, '127.0.0.1', () => log.info(`LPA listening on http://127.0.0.1:${PORT}`));
 }
