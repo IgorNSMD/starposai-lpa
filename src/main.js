@@ -375,6 +375,36 @@ function setupServer() {
     }
   });
 
+  // POST /cash/print-blank
+  // Abre el cajón imprimiendo un ticket mínimo.
+  // Requiere que el driver de la impresora tenga activado "cash drawer kick".
+  srv.post('/cash/print-blank', async (req, res) => {
+    try {
+      const { printerName = null, widthMm = 80, copies = 1 } = req.body || {};
+
+      // ticket mínimo (casi vacío)
+      const html = `
+        <!doctype html><html><head><meta charset="utf-8">
+        <style>
+          @page { size: ${widthMm}mm auto; margin: 0; }
+          html, body { margin:0; padding:0; }
+          .line { height: 1mm; } /* una "línea" mínima */
+        </style>
+        </head>
+        <body><div class="line">&nbsp;</div></body></html>
+      `;
+
+      // Usa tu helper existente de impresión silenciosa:
+      // printHTMLSilent(html, deviceName, copies = 1, widthMm = 80)
+      await printHTMLSilent(html, printerName, copies, widthMm);
+
+      res.json({ ok: true, printer: printerName, widthMm, copies });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
+  });
+
+
   
   // ==============================
   // Imprimir RAW (bytes ESC/POS) usando WritePrinter (robusto)
