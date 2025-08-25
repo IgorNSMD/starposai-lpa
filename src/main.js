@@ -375,8 +375,9 @@ function setupServer() {
     }
   });
 
+  
   // ==============================
-  // Imprimir RAW (bytes ESC/POS)
+  // Imprimir RAW (bytes ESC/POS) usando WritePrinter (robusto)
   // ==============================
   srv.post('/print/raw', async (req, res) => {
     try {
@@ -397,92 +398,209 @@ function setupServer() {
         (await getWindowsDefaultPrinterName()) ||
         printers[0].name;
 
-      // Convertir array numérico a Buffer
-      const data = Buffer.from(raw);
+      // ── PowerShell script que usa Winspool (WritePrinter) ──────────
+      // Enviamos los bytes sin alterar nada (RAW).
+      const psScript = `
+    $ErrorActionPreference = 'Stop'
+    $printer = ${JSON.stringify(target)}
+    $bytes = [byte[]]@(${raw.join(',')})
+    $copies = ${Math.max(1, Number(copies) || 1)}
 
-      // Enviar al spooler de Windows usando "print /D"
-      // Guardamos a un archivo temporal .bin para luego mandar
-      const fs = require('fs');
-      const os = require('os');
-      const path = require('path');
-      const { exec } = require('child_process');
+    Add-Type -TypeDefinition @"
+    using System;
+    using System.Runtime.InteropServices;
+    public class RawPrinter {
+      [StructLayout(LayoutKind.Sequential)]
+      public class DOCINFOA {
+        [MarshalAs(UnmanagedType.LPStr)] public string pDocName;
+        [MarshalAs(UnmanagedType.LPStr)] public string pOutputFile;
+        [MarshalAs(UnmanagedType.LPStr)] public string pDataType;
+      }
+      [DllImport("winspool.Drv", EntryPoint="OpenPrinterA", SetLastError=true)]
+      public static extern bool OpenPrinter(string pPrinterName, out IntPtr phPrinter, IntPtr pDefault);
+      [DllImport("winspool.Drv", SetLastError=true)]
+      public static extern bool ClosePrinter(IntPtr hPrinter);
+      [DllImport("winspool.Drv", EntryPoint="StartDocPrinterA", SetLastError=true)]
+      public static extern bool StartDocPrinter(IntPtr hPrinter, int level, DOCINFOA di);
+      [DllImport("winspool.Drv", SetLastError=true)]
+      public static extern bool EndDocPrinter(IntPtr hPrinter);
+      [DllImport("winspool.Drv", SetLastError=true)]
+      public static extern bool StartPagePrinter(IntPtr hPrinter);
+      [DllImport("winspool.Drv", SetLastError=true)]
+      public static extern bool EndPagePrinter(IntPtr hPrinter);
+      [DllImport("winspool.Drv", SetLastError=true)]
+      public static extern bool WritePrinter(IntPtr hPrinter, byte[] pBytes, int dwCount, out int dwWritten);
+    }
+    "@
 
-      const tmpFile = path.join(os.tmpdir(), `lpa-raw-${Date.now()}.bin`);
-      fs.writeFileSync(tmpFile, data);
+    IntPtr $h = [IntPtr]::Zero
+    if (-not [RawPrinter]::OpenPrinter($printer, [ref]$h, [IntPtr]::Zero)) { throw "OpenPrinter failed: $printer" }
 
-      exec(`print /D:"${target}" "${tmpFile}"`, (err, stdout, stderr) => {
-        fs.unlink(tmpFile, () => {});
-        if (err) {
-          log.error('print_raw_error', err);
-          return res.status(500).json({ ok: false, error: String(err) });
+    try {
+      $doc = New-Object RawPrinter+DOCINFOA
+      $doc.pDocName = "STARPOSAI RAW"
+      $doc.pOutputFile = $null
+      $doc.pDataType = "RAW"
+
+      if (-not [RawPrinter]::StartDocPrinter($h, 1, $doc)) { throw "StartDocPrinter failed" }
+      try {
+        for ($i=0; $i -lt $copies; $i++) {
+          if (-not [RawPrinter]::StartPagePrinter($h)) { throw "StartPagePrinter failed" }
+          try {
+            [int]$written = 0
+            if (-not [RawPrinter]::WritePrinter($h, $bytes, $bytes.Length, [ref]$written)) {
+              throw "WritePrinter failed"
+            }
+          } finally {
+            [RawPrinter]::EndPagePrinter($h) | Out-Null
+          }
         }
-        res.json({ ok: true, printer: target, bytes: raw.length, copies });
+      } finally {
+        [RawPrinter]::EndDocPrinter($h) | Out-Null
+      }
+    } finally {
+      [RawPrinter]::ClosePrinter($h) | Out-Null
+    }
+    [Console]::Out.WriteLine("{ \\"ok\\": true }")
+    `;
+
+      const { execFile } = require('child_process');
+      const psArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psScript];
+
+      execFile('powershell.exe', psArgs, { windowsHide: true }, (err, stdout, stderr) => {
+        if (err) {
+          log.error('print_raw_ps_error', err, stderr);
+          return res.status(500).json({ ok: false, error: String(stderr || err.message || err) });
+        }
+        // devolvemos también impresora y tamaño del buffer para trazabilidad
+        res.json({ ok: true, printer: target, bytes: raw.length, copies: Math.max(1, Number(copies)||1) });
       });
+
     } catch (e) {
       log.error(e);
       res.status(500).json({ ok: false, error: String(e) });
     }
   });
 
-  // Abre cajón con ESC p, con opción de simulación
+
+
+  // Abre cajón con ESC/POS (ESC p m t1 t2) usando WritePrinter (robusto)
+  // Soporta: { printerName?: string, pin?: 0|1, on?: number, off?: number, copies?: number, simulate?: boolean }
   srv.post('/cash/open', async (req, res) => {
     try {
-      const { printerName, pin = 0, on = 50, off = 200, simulate = false } = req.body || {};
+      const { printerName, pin = 0, on = 50, off = 200, copies = 1, simulate = false } = req.body || {};
 
-      // Si simulamos, no tocamos spooler: dejamos "huellas" comprobables
+      // simulación local (sin hardware): deja "huella" en Descargas/STARPOSAI
       if (simulate) {
         const fs = require('fs');
         const path = require('path');
         const { app } = require('electron');
-
         const dir = path.join(app.getPath('downloads'), 'STARPOSAI');
         fs.mkdirSync(dir, { recursive: true });
         const file = path.join(dir, `drawer-sim-${Date.now()}.txt`);
-        fs.writeFileSync(file, `SIMULATED CASH DRAWER OPEN\npin=${pin} on=${on} off=${off}\n`);
-
-        // (Opcional) Notificación Windows
-        try {
-          const { exec } = require('child_process');
-          exec(`powershell -NoProfile -Command "New-BurntToastNotification -Text 'STARPOSAI', 'Simulación: Cajón abierto'"`);
-        } catch { /* no crítico */ }
-
-        return res.json({ ok: true, simulated: true, file, pin, on, off });
+        fs.writeFileSync(file, `SIMULATED CASH DRAWER OPEN\npin=${pin} on=${on} off=${off} copies=${copies}\n`);
+        return res.json({ ok: true, simulated: true, file, pin, on, off, copies: Math.max(1, Number(copies)||1) });
       }
 
-      // --- Modo real: enviar ESC p ---
+      // resolver impresora objetivo
       const w = ensureWindow();
       const printers = await w.webContents.getPrintersAsync();
       if (!Array.isArray(printers) || printers.length === 0) {
         return res.status(404).json({ ok: false, error: 'no_printers' });
       }
-
       const target =
         printerName ||
         printers.find((p) => p.isDefault)?.name ||
         (await getWindowsDefaultPrinterName()) ||
         printers[0].name;
 
-      const data = Buffer.from([0x1B, 0x70, Number(pin)||0, Number(on)||50, Number(off)||200]);
+      // bytes ESC p m t1 t2  (clamps 0..255)
+      const m  = Math.max(0, Math.min(1, Number(pin) || 0));
+      const t1 = Math.max(0, Math.min(255, Number(on)  || 50));
+      const t2 = Math.max(0, Math.min(255, Number(off) || 200));
+      const raw = [0x1B, 0x70, m, t1, t2];
 
-      const fs = require('fs');
-      const os = require('os');
-      const path = require('path');
-      const { exec } = require('child_process');
+      // PowerShell script que usa Winspool (WritePrinter) para enviar RAW tal cual
+      const psScript = `
+        $ErrorActionPreference = 'Stop'
+        $printer = ${JSON.stringify(target)}
+        $bytes   = [byte[]]@(${raw.join(',')})
+        $copies  = ${Math.max(1, Number(copies) || 1)}
 
-      const tmpFile = path.join(os.tmpdir(), `lpa-cash-${Date.now()}.bin`);
-      fs.writeFileSync(tmpFile, data);
+        Add-Type -TypeDefinition @"
+        using System;
+        using System.Runtime.InteropServices;
+        public class RawPrinter {
+          [StructLayout(LayoutKind.Sequential)]
+          public class DOCINFOA {
+            [MarshalAs(UnmanagedType.LPStr)] public string pDocName;
+            [MarshalAs(UnmanagedType.LPStr)] public string pOutputFile;
+            [MarshalAs(UnmanagedType.LPStr)] public string pDataType;
+          }
+          [DllImport("winspool.Drv", EntryPoint="OpenPrinterA", SetLastError=true)]
+          public static extern bool OpenPrinter(string pPrinterName, out IntPtr phPrinter, IntPtr pDefault);
+          [DllImport("winspool.Drv", SetLastError=true)]
+          public static extern bool ClosePrinter(IntPtr hPrinter);
+          [DllImport("winspool.Drv", EntryPoint="StartDocPrinterA", SetLastError=true)]
+          public static extern bool StartDocPrinter(IntPtr hPrinter, int level, DOCINFOA di);
+          [DllImport("winspool.Drv", SetLastError=true)]
+          public static extern bool EndDocPrinter(IntPtr hPrinter);
+          [DllImport("winspool.Drv", SetLastError=true)]
+          public static extern bool StartPagePrinter(IntPtr hPrinter);
+          [DllImport("winspool.Drv", SetLastError=true)]
+          public static extern bool EndPagePrinter(IntPtr hPrinter);
+          [DllImport("winspool.Drv", SetLastError=true)]
+          public static extern bool WritePrinter(IntPtr hPrinter, byte[] pBytes, int dwCount, out int dwWritten);
+        }
+        "@
 
-      exec(`print /D:"${target}" "${tmpFile}"`, (err) => {
-        fs.unlink(tmpFile, () => {});
-        if (err) return res.status(500).json({ ok: false, error: String(err) });
-        res.json({ ok: true, simulated: false, printer: target, pin: Number(pin)||0, on: Number(on)||50, off: Number(off)||200 });
-      });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: String(e) });
-    }
+        IntPtr $h = [IntPtr]::Zero
+        if (-not [RawPrinter]::OpenPrinter($printer, [ref]$h, [IntPtr]::Zero)) { throw "OpenPrinter failed: $printer" }
+
+        try {
+          $doc = New-Object RawPrinter+DOCINFOA
+          $doc.pDocName = "STARPOSAI CASH OPEN"
+          $doc.pOutputFile = $null
+          $doc.pDataType = "RAW"
+
+          if (-not [RawPrinter]::StartDocPrinter($h, 1, $doc)) { throw "StartDocPrinter failed" }
+          try {
+            for ($i=0; $i -lt $copies; $i++) {
+              if (-not [RawPrinter]::StartPagePrinter($h)) { throw "StartPagePrinter failed" }
+              try {
+                [int]$written = 0
+                if (-not [RawPrinter]::WritePrinter($h, $bytes, $bytes.Length, [ref]$written)) {
+                  throw "WritePrinter failed"
+                }
+              } finally {
+                [RawPrinter]::EndPagePrinter($h) | Out-Null
+              }
+            }
+          } finally {
+            [RawPrinter]::EndDocPrinter($h) | Out-Null
+          }
+        } finally {
+          [RawPrinter]::ClosePrinter($h) | Out-Null
+        }
+        [Console]::Out.WriteLine("{ \\"ok\\": true }")
+        `;
+
+            const { execFile } = require('child_process');
+            const psArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psScript];
+
+            execFile('powershell.exe', psArgs, { windowsHide: true }, (err, stdout, stderr) => {
+              if (err) {
+                log.error('[cash/open] WritePrinter error:', err, stderr);
+                return res.status(500).json({ ok: false, error: String(stderr || err.message || err) });
+              }
+              res.json({ ok: true, simulated: false, printer: target, pin: m, on: t1, off: t2, copies: Math.max(1, Number(copies)||1) });
+            });
+
+          } catch (e) {
+            log.error(e);
+            res.status(500).json({ ok: false, error: String(e) });
+          }
   });
-
-
 
   srv.listen(PORT, '127.0.0.1', () => log.info(`LPA listening on http://127.0.0.1:${PORT}`));
 }
