@@ -632,6 +632,111 @@ function setupServer() {
           }
   });
 
+
+  // === Helpers locales (si ya los tienes, puedes reusar los tuyos) ===
+async function resolveTargetPrinterName(preferred) {
+  const w = ensureWindow();
+  const printers = await w.webContents.getPrintersAsync();
+  if (!Array.isArray(printers) || printers.length === 0) return null;
+
+  if (preferred && printers.some(p => p.name === preferred)) return preferred;
+  const def = printers.find(p => p.isDefault)?.name;
+  if (def) return def;
+
+  // fallback a getWindowsDefaultPrinterName si lo tienes definido
+  try {
+    const sysDef = await getWindowsDefaultPrinterName?.();
+    if (sysDef) return sysDef;
+  } catch {}
+  return printers[0].name;
+}
+
+  // Enviar RAW a una impresora usando Winspool (PowerShell → WritePrinter)
+  function sendRawToPrinter(printerName, bytes, cb) {
+    const { execFile } = require('child_process');
+    const ps = `
+  $printer = "${printerName}"
+  $bytes = ${JSON.stringify(Array.from(bytes))}
+  Add-Type -Name Win32 -Namespace Native -MemberDefinition @"
+    [System.Runtime.InteropServices.DllImport("winspool.Drv", SetLastError=true, CharSet=System.Runtime.InteropServices.CharSet.Auto)]
+    public static extern bool OpenPrinter(string pPrinterName, out System.IntPtr phPrinter, System.IntPtr pDefault);
+    [System.Runtime.InteropServices.DllImport("winspool.Drv", SetLastError=true)]
+    public static extern bool ClosePrinter(System.IntPtr hPrinter);
+    [System.Runtime.InteropServices.DllImport("winspool.Drv", SetLastError=true)]
+    public static extern bool StartDocPrinter(System.IntPtr hPrinter, int Level, System.IntPtr pDocInfo);
+    [System.Runtime.InteropServices.DllImport("winspool.Drv", SetLastError=true)]
+    public static extern bool EndDocPrinter(System.IntPtr hPrinter);
+    [System.Runtime.InteropServices.DllImport("winspool.Drv", SetLastError=true)]
+    public static extern bool StartPagePrinter(System.IntPtr hPrinter);
+    [System.Runtime.InteropServices.DllImport("winspool.Drv", SetLastError=true)]
+    public static extern bool EndPagePrinter(System.IntPtr hPrinter);
+    [System.Runtime.InteropServices.DllImport("winspool.Drv", SetLastError=true)]
+    public static extern bool WritePrinter(System.IntPtr hPrinter, byte[] pBytes, int dwCount, out int dwWritten);
+  "@
+  $h=[IntPtr]::Zero
+  if(-not [Native.Win32]::OpenPrinter($printer,[ref]$h,[IntPtr]::Zero)){ throw "OpenPrinter failed" }
+  try{
+    if(-not [Native.Win32]::StartDocPrinter($h,1,[IntPtr]::Zero)){ throw "StartDocPrinter failed" }
+    if(-not [Native.Win32]::StartPagePrinter($h)){ throw "StartPagePrinter failed" }
+    $buf = [byte[]]$bytes
+    $w = 0
+    if(-not [Native.Win32]::WritePrinter($h,$buf,$buf.Length,[ref]$w)){ throw "WritePrinter failed" }
+    [Native.Win32]::EndPagePrinter($h) | Out-Null
+    [Native.Win32]::EndDocPrinter($h) | Out-Null
+    Write-Output ("WROTE=" + $w)
+  } finally {
+    [Native.Win32]::ClosePrinter($h) | Out-Null
+  }
+  `.replace(/\r\n/g, '\n');
+
+    // Ejecutar PowerShell sin ventana
+    execFile('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], { windowsHide: true }, (err, stdout, stderr) => {
+      if (err) return cb(err);
+      return cb(null, (stdout || '').trim());
+    });
+  }
+
+  // ===============================
+  // GET /cash/test
+  //   Probar apertura de cajón vía ESC p
+  //   Parámetros (query):
+  //     printer   → nombre exacto (opcional; si no, usa la predeterminada)
+  //     pin       → 0 ó 1 (default 0)
+  //     on        → 0..255 (default 50)    ; ~2ms * on
+  //     off       → 0..255 (default 200)   ; ~2ms * off
+  //     simulate  → 1 para no enviar a la impresora (solo log)
+  // Ejemplos:
+  //   http://127.0.0.1:9723/cash/test
+  //   http://127.0.0.1:9723/cash/test?pin=1&on=60&off=220
+  //   http://127.0.0.1:9723/cash/test?printer=EPSON%20TM-T20&simulate=1
+  // ===============================
+  srv.get('/cash/test', async (req, res) => {
+    try {
+      const q = req.query || {};
+      const pin = Number.isFinite(Number(q.pin)) ? Number(q.pin) : 0;
+      const on  = Number.isFinite(Number(q.on))  ? Number(q.on)  : 50;
+      const off = Number.isFinite(Number(q.off)) ? Number(q.off) : 200;
+      const simulate = q.simulate === '1' || q.simulate === 'true';
+      const preferred = typeof q.printer === 'string' && q.printer.length ? q.printer : null;
+
+      const target = await resolveTargetPrinterName(preferred);
+      if (!target) return res.status(404).json({ ok:false, error:'no_printers' });
+
+      const bytes = Buffer.from([0x1B, 0x70, pin, on, off]);
+
+      if (simulate) {
+        return res.json({ ok:true, simulated:true, printer: target, pin, on, off, note:'No se envió a la impresora.' });
+      }
+
+      sendRawToPrinter(target, bytes, (err, out) => {
+        if (err) return res.status(500).json({ ok:false, error:String(err), printer: target });
+        return res.json({ ok:true, printer: target, pin, on, off, wrote: out });
+      });
+    } catch (e) {
+      res.status(500).json({ ok:false, error:String(e) });
+    }
+  });
+
   srv.listen(PORT, '127.0.0.1', () => log.info(`LPA listening on http://127.0.0.1:${PORT}`));
 }
 
