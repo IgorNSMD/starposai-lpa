@@ -665,121 +665,143 @@ function setupServer() {
   //   http://127.0.0.1:9723/cash/test?printer=EPSON%20TM-T20&simulate=1
   // ===============================
   // GET /cash/test?pin=0&on=50&off=200&printer=...&simulate=1
+  // main.js (añade/reemplaza este endpoint)
   srv.get('/cash/test', async (req, res) => {
-  try {
-    const fs = require('fs');
-    const os = require('os');
-    const path = require('path');
-    const { execFile } = require('child_process');
+    try {
+      const url = new URL(req.url, 'http://localhost');
+      const printer = url.searchParams.get('printer') || (await getWindowsDefaultPrinterName());
+      const pin = Number(url.searchParams.get('pin') ?? 0) | 0;   // 0 ó 1
+      const on  = Number(url.searchParams.get('on')  ?? 50) | 0;  // 2ms * on
+      const off = Number(url.searchParams.get('off') ?? 200) | 0; // 2ms * off
+      const simulate = url.searchParams.has('simulate');
 
-    const pin = Number.isFinite(Number(req.query.pin)) ? Number(req.query.pin) : 0;
-    const on  = Number.isFinite(Number(req.query.on))  ? Number(req.query.on)  : 50;
-    const off = Number.isFinite(Number(req.query.off)) ? Number(req.query.off) : 200;
-    const simulate  = req.query.simulate === '1' || req.query.simulate === 'true';
-    const preferred = typeof req.query.printer === 'string' && req.query.printer.length ? req.query.printer : null;
+      if (!printer) return res.json({ ok:false, error:'no_default_printer' });
+      if (simulate) return res.json({ ok:true, simulated:true, printer, pin, on, off, note:'No se envió a la impresora.' });
 
-    const target = await resolveTargetPrinterName(preferred);
-    if (!target) return res.status(404).json({ ok:false, error:'no_printers' });
+      const os  = require('os');
+      const fs  = require('fs');
+      const path= require('path');
+      const { execFile } = require('child_process');
 
-    if (simulate) {
-      return res.json({ ok:true, simulated:true, printer: target, pin, on, off, note:'No se envió a la impresora.' });
+      // bytes ESC p m t1 t2
+      const bytes = [27, 112, pin, on, off]; // 0x1B, 0x70, m, t1, t2
+
+      const tmpDir  = os.tmpdir();
+      const ps1Path = path.join(tmpDir, `lpa-cash-${Date.now()}.ps1`);
+
+      // Script PowerShell sin here-strings y sin espacios antes de terminadores
+      // NOTA: todo está alineado a la columna 1 para evitar 'WhitespaceBeforeHereStringFooter'
+      const ps = [
+        "Add-Type @'",
+        "using System;",
+        "using System.Runtime.InteropServices;",
+        "public class RawPrinter {",
+        "  [DllImport(\"winspool.drv\", SetLastError=true, CharSet=System.Runtime.InteropServices.CharSet.Auto)]",
+        "  public static extern bool OpenPrinter(string pPrinterName, out IntPtr phPrinter, IntPtr pDefault);",
+        "  [DllImport(\"winspool.drv\", SetLastError=true)]",
+        "  public static extern bool ClosePrinter(IntPtr hPrinter);",
+        "  [DllImport(\"winspool.drv\", SetLastError=true)]",
+        "  public static extern bool StartDocPrinter(IntPtr hPrinter, int level, IntPtr pDocInfo);",
+        "  [DllImport(\"winspool.drv\", SetLastError=true)]",
+        "  public static extern bool EndDocPrinter(IntPtr hPrinter);",
+        "  [DllImport(\"winspool.drv\", SetLastError=true)]",
+        "  public static extern bool StartPagePrinter(IntPtr hPrinter);",
+        "  [DllImport(\"winspool.drv\", SetLastError=true)]",
+        "  public static extern bool EndPagePrinter(IntPtr hPrinter);",
+        "  [DllImport(\"winspool.drv\", SetLastError=true)]",
+        "  public static extern bool WritePrinter(IntPtr hPrinter, byte[] pBytes, int dwCount, out int dwWritten);",
+        "}",
+        "'@",
+        `$name = '${printer.replace(/'/g, "''")}'`,
+        `$b = [byte[]](${bytes.join(',')})`,
+        "$h=[IntPtr]::Zero; if(-not [RawPrinter]::OpenPrinter($name, [ref]$h, [IntPtr]::Zero)){ throw 'OpenPrinter failed' }",
+        "try {",
+        "  # DOC_INFO_1 (via Marshal): pDocName, pOutputFile, pDatatype='RAW'",
+        "  $size = [Runtime.InteropServices.Marshal]::SizeOf([IntPtr]) * 3",
+        "  $p = [Runtime.InteropServices.Marshal]::AllocHGlobal($size)",
+        "  [Runtime.InteropServices.Marshal]::WriteIntPtr($p, 0, [Runtime.InteropServices.Marshal]::StringToHGlobalUni('LPA-Cash'))",
+        "  [Runtime.InteropServices.Marshal]::WriteIntPtr($p, [IntPtr]::Size, [IntPtr]::Zero)",
+        "  [Runtime.InteropServices.Marshal]::WriteIntPtr($p, [IntPtr]::Size*2, [Runtime.InteropServices.Marshal]::StringToHGlobalUni('RAW'))",
+        "  try {",
+        "    if(-not [RawPrinter]::StartDocPrinter($h, 1, $p)){ throw 'StartDocPrinter failed' }",
+        "    try {",
+        "      if(-not [RawPrinter]::StartPagePrinter($h)){ throw 'StartPagePrinter failed' }",
+        "      try {",
+        "        $out=0; if(-not [RawPrinter]::WritePrinter($h,$b,$b.Length,[ref]$out)){ throw 'WritePrinter failed' }",
+        "      } finally { [RawPrinter]::EndPagePrinter($h) | Out-Null }",
+        "    } finally { [RawPrinter]::EndDocPrinter($h) | Out-Null }",
+        "  } finally {",
+        "    # libera strings",
+        "    [Runtime.InteropServices.Marshal]::FreeHGlobal([Runtime.InteropServices.Marshal]::ReadIntPtr($p,0))",
+        "    [Runtime.InteropServices.Marshal]::FreeHGlobal([Runtime.InteropServices.Marshal]::ReadIntPtr($p,[IntPtr]::Size*2))",
+        "    [Runtime.InteropServices.Marshal]::FreeHGlobal($p)",
+        "  }",
+        "} finally { [RawPrinter]::ClosePrinter($h) | Out-Null }"
+      ].join("\r\n");
+
+      fs.writeFileSync(ps1Path, ps, { encoding: 'utf8' });
+
+      execFile('powershell.exe',
+        ['-NoProfile','-ExecutionPolicy','Bypass','-File', ps1Path],
+        { windowsHide:true },
+        (err, stdout, stderr) => {
+          try { fs.unlinkSync(ps1Path); } catch {}
+          if (err) {
+            return res.json({ ok:false, error:String(err), stdout, stderr, printer, pin, on, off });
+          }
+          res.json({ ok:true, printer, pin, on, off, stdout: stdout?.trim() });
+        }
+      );
+    } catch(e) {
+      res.json({ ok:false, error:String(e) });
     }
+  });
 
-    const bytesArr = [0x1B, 0x70, pin, on, off];
-    const bytesCsv = bytesArr.join(',');
+  // main.js (nuevo endpoint)
+  /**
+   * GET /cash/test2?printer=<name>&pin=0&on=60&off=220
+   * Requiere que la impresora esté COMPARTIDA en Windows.
+   */
+  srv.get('/cash/test2', async (req, res) => {
+    try {
+      const url = new URL(req.url, 'http://localhost');
+      const printer = url.searchParams.get('printer') || (await getWindowsDefaultPrinterName());
+      const pin = Number(url.searchParams.get('pin') ?? 0) | 0;
+      const on  = Number(url.searchParams.get('on')  ?? 60) | 0;
+      const off = Number(url.searchParams.get('off') ?? 220) | 0;
 
-    const tmpDir = os.tmpdir();
-    const csPath  = path.join(tmpDir, `lpa-cash-${Date.now()}.cs`);
-    const ps1Path = path.join(tmpDir, `lpa-cash-${Date.now()}.ps1`);
+      if (!printer) return res.json({ ok:false, error:'no_default_printer' });
 
-    // --- archivo C# temporal: RawWinspool.cs ---
-    const csCode =
-`using System;
-using System.Runtime.InteropServices;
+      const { exec } = require('child_process');
+      const os  = require('os'); const fs = require('fs'); const path = require('path');
 
-public static class RawWinspool {
-  [DllImport("winspool.Drv", SetLastError=true, CharSet=CharSet.Auto)]
-  public static extern bool OpenPrinter(string pPrinterName, out IntPtr phPrinter, IntPtr pDefault);
+      // 1) ShareName
+      exec(`powershell -NoProfile -Command "(Get-Printer -Name '${printer.replace(/'/g, "''")}').ShareName"`,
+        (e, stdout) => {
+          const share = (stdout||'').toString().trim();
+          if (e || !share) {
+            return res.json({ ok:false, error:'printer_not_shared', note:'Comparte la impresora en Windows o pasa ?share=<nombre>' });
+          }
 
-  [DllImport("winspool.Drv", SetLastError=true)]
-  public static extern bool ClosePrinter(IntPtr hPrinter);
+          // 2) archivo temporal con bytes ESC p
+          const tmp = path.join(os.tmpdir(), `lpa-cash-${Date.now()}.bin`);
+          fs.writeFileSync(tmp, Buffer.from([27,112,pin,on,off]));
 
-  [DllImport("winspool.Drv", SetLastError=true)]
-  public static extern bool StartDocPrinter(IntPtr hPrinter, int Level, IntPtr pDocInfo);
-
-  [DllImport("winspool.Drv", SetLastError=true)]
-  public static extern bool EndDocPrinter(IntPtr hPrinter);
-
-  [DllImport("winspool.Drv", SetLastError=true)]
-  public static extern bool StartPagePrinter(IntPtr hPrinter);
-
-  [DllImport("winspool.Drv", SetLastError=true)]
-  public static extern bool EndPagePrinter(IntPtr hPrinter);
-
-  [DllImport("winspool.Drv", SetLastError=true)]
-  public static extern bool WritePrinter(IntPtr hPrinter, byte[] pBytes, int dwCount, out int dwWritten);
-}
-`;
-    fs.writeFileSync(csPath, csCode, 'utf8');
-
-    // --- script PowerShell que carga el .cs con -Path (sin here-strings) ---
-    const ps1Code =
-`param(
-  [string]$Printer,
-  [string]$BytesCsv,
-  [string]$CsPath
-)
-$bytes = [byte[]]($BytesCsv -split ',')
-Add-Type -Path $CsPath
-[IntPtr]$h = [IntPtr]::Zero
-if (-not [RawWinspool]::OpenPrinter($Printer, [ref]$h, [IntPtr]::Zero)) { throw "OpenPrinter failed" }
-try {
-  if (-not [RawWinspool]::StartDocPrinter($h, 1, [IntPtr]::Zero)) { throw "StartDocPrinter failed" }
-  if (-not [RawWinspool]::StartPagePrinter($h)) { throw "StartPagePrinter failed" }
-
-  [int]$w = 0
-  if (-not [RawWinspool]::WritePrinter($h, $bytes, $bytes.Length, [ref]$w)) { throw "WritePrinter failed" }
-
-  [RawWinspool]::EndPagePrinter($h) | Out-Null
-  [RawWinspool]::EndDocPrinter($h)  | Out-Null
-  Write-Output ("WROTE=" + $w)
-}
-finally {
-  [RawWinspool]::ClosePrinter($h) | Out-Null
-}
-`;
-    fs.writeFileSync(ps1Path, ps1Code, 'utf8');
-
-    // Ejecutar PowerShell con -File (¡sin here-strings!)
-    execFile(
-      'powershell',
-      ['-NoProfile','-ExecutionPolicy','Bypass','-File', ps1Path, target, bytesCsv, csPath],
-      { windowsHide: true },
-      (err, stdout, stderr) => {
-        // limpieza
-        fs.unlink(ps1Path, ()=>{});
-        fs.unlink(csPath,  ()=>{});
-
-        if (err) {
-          return res.status(500).json({
-            ok:false,
-            error:String(err),
-            printer: target,
-            stderr: (stderr||'').toString()
+          // 3) copy /b a la cola compartida
+          const target = `\\\\127.0.0.1\\${share}`;
+          exec(`cmd /c copy /b "${tmp}" "${target}"`, (err, so, se) => {
+            try { fs.unlinkSync(tmp); } catch {}
+            if (err) return res.json({ ok:false, error:String(err), stdout:so, stderr:se, target, share });
+            res.json({ ok:true, target, share, pin, on, off, stdout: so?.toString().trim() });
           });
         }
-        return res.json({
-          ok:true,
-          printer: target,
-          pin, on, off,
-          wrote: (stdout||'').toString().trim()
-        });
-      }
-    );
-  } catch (e) {
-    return res.status(500).json({ ok:false, error:String(e) });
-  }
-});
+      );
+    } catch (e) {
+      res.json({ ok:false, error:String(e) });
+    }
+  });
+
+
 
   srv.listen(PORT, '127.0.0.1', () => log.info(`LPA listening on http://127.0.0.1:${PORT}`));
 }
