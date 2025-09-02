@@ -3,9 +3,7 @@
   "version": "1.0.17",
   "description": "Local Print Agent para STARPOSAI (Electron + auto-update)",
   "private": true,
-
   "main": "src/main.js",
-
   "scripts": {
     "dev": "concurrently -k \"npm:serve\" \"npm:electron\"",
     "serve": "node src/scripts/dev-server.js",
@@ -17,16 +15,15 @@
     "test:print": "node test-print.js \"Impresora Ticket 80mm (Ficticia)\" 1",
     "test-default-printer": "node test-default-printer.js"
   },
-
   "keywords": [],
   "author": "",
   "license": "ISC",
-
   "dependencies": {
     "cors": "^2.8.5",
     "electron-log": "^5.4.2",
     "electron-updater": "^6.6.2",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "serialport": "^11.0.1"
   },
   "devDependencies": {
     "concurrently": "^9.2.0",

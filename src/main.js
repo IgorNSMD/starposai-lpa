@@ -9,7 +9,7 @@ const express = require('express');
 const cors = require('cors');
 const { execFile, exec } = require('child_process');
 
-const { SerialPort } = require('serialport');
+//const { SerialPort } = require('serialport');
 const http = require('http');
 const net = require('net');
 const usb = require('usb');
@@ -351,20 +351,35 @@ async function openCash_Serial({ com='COM3', baudRate=9600, pin=0, on=50, off=20
   });
 }
 
-// === Helpers locales (si ya los tienes, puedes reusar los tuyos) ===
-async function resolveTargetPrinterName(preferred) {
-const w = ensureWindow();
-const printers = await w.webContents.getPrintersAsync();
-if (!Array.isArray(printers) || printers.length === 0) return null;
-if (preferred && printers.some(p => p.name === preferred)) return preferred;
-const def = printers.find(p => p.isDefault)?.name;
-if (def) return def;
-try {
-  const sysDef = await getWindowsDefaultPrinterName?.();
-  if (sysDef) return sysDef;
-} catch {}
-return printers[0].name;
+// --- Lazy loader para serialport ---
+let _SerialPort = null;
+async function ensureSerialport() {
+  if (_SerialPort) return _SerialPort;
+  try {
+    // serialport v10/v11 expone { SerialPort } o default según versión
+    const sp = require('serialport');
+    _SerialPort = sp.SerialPort || sp; // compat
+    return _SerialPort;
+  } catch (e) {
+    const err = new Error('serialport_not_installed');
+    err.cause = e;
+    throw err;
+  }
 }
+// === Helpers locales (si ya los tienes, puedes reusar los tuyos) ===
+// async function resolveTargetPrinterName(preferred) {
+// const w = ensureWindow();
+// const printers = await w.webContents.getPrintersAsync();
+// if (!Array.isArray(printers) || printers.length === 0) return null;
+// if (preferred && printers.some(p => p.name === preferred)) return preferred;
+// const def = printers.find(p => p.isDefault)?.name;
+// if (def) return def;
+// try {
+//   const sysDef = await getWindowsDefaultPrinterName?.();
+//   if (sysDef) return sysDef;
+// } catch {}
+// return printers[0].name;
+// }
 
 // ------------------------------
 // API HTTP (Express)
@@ -877,8 +892,8 @@ function setupServer() {
   // Lista rápida de puertos serie disponibles (ayuda a cliente)
   srv.get('/cash/serial/ports', async (_req, res) => {
     try {
+      const SerialPort = await ensureSerialport();
       const list = await SerialPort.list();
-      // normalizamos campos más útiles
       const out = list.map(p => ({
         path: p.path,
         friendlyName: p.friendlyName || p.manufacturer || null,
@@ -886,9 +901,11 @@ function setupServer() {
         vendorId: p.vendorId || null,
         productId: p.productId || null,
       }));
-      res.json({ ok:true, ports: out });
+      res.json({ ok: true, ports: out });
     } catch (e) {
-      logd('SERIAL_LIST_ERR', String(e));
+      if (String(e.message) === 'serialport_not_installed') {
+        return res.status(501).json({ ok:false, error:'serialport_not_installed' });
+      }
       res.status(500).json({ ok:false, error:String(e) });
     }
   });

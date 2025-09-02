@@ -1,33 +1,38 @@
-appId: com.starposai.lpa
-productName: Starposai Local Print Agent
-
+# electron-builder.yml
+appId: com.tuempresa.starposai.lpa
+productName: Starposai LPA
 directories:
   output: dist
+  buildResources: build
 
-# Incluye el código fuente y el package.json
+# 👇 importante para módulos nativos como serialport
+asar: true
+asarUnpack:
+  - "node_modules/serialport/**"
+  - "node_modules/@serialport/**"
+
 files:
-  - "src/**/*"
+  - "build/**/*"
+  - "resources/**/*"
   - "package.json"
-
-# Descomenta cuando tengas recursos reales
-# buildResources: build
-# extraResources:
-#   - from: assets
-#     to: assets
+  - "!**/*.map"
+  - "!**/node_modules/.bin"
+  # (tus exclusiones habituales)
 
 win:
   target:
-    - nsis
-  artifactName: Starposai-LPA-Setup-${version}.exe
+    - target: nsis
+      arch:
+        - x64
+        - ia32   # si necesitas 32-bit, sino quítalo
+  artifactName: "${productName}-Setup-${version}.${ext}"
 
 nsis:
   oneClick: true
   perMachine: false
-  allowElevation: true
-  runAfterFinish: true
+  allowToChangeInstallationDirectory: false
 
 publish:
-  provider: github
-  owner: IgorNSMD
-  repo: starposai-lpa
-  releaseType: release   # <-- agrega esta línea
+  - provider: github
+    owner: IgorNSMD
+    repo: starposai-lpa
