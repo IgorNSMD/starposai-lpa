@@ -1,30 +1,35 @@
-# electron-builder.yml
 appId: com.tuempresa.starposai.lpa
 productName: Starposai LPA
-directories:
-  output: dist
-  buildResources: build
 
-# 👇 importante para módulos nativos como serialport
 asar: true
 asarUnpack:
   - "node_modules/serialport/**"
   - "node_modules/@serialport/**"
 
+directories:
+  output: dist
+  buildResources: build
+
 files:
-  - "build/**/*"
+  # 👉 incluye el código fuente que se ejecuta en producción
+  - "src/**/*"
   - "resources/**/*"
+  - "ticket.html"          # si la usas
   - "package.json"
+
+  # Excluye lo que NO quieras dentro del asar
+  - "!dist/**"
   - "!**/*.map"
   - "!**/node_modules/.bin"
-  # (tus exclusiones habituales)
+  - "!**/tests?(-*)/**"
+  - "!**/*.ts"             # si no transpilas y solo usas .js
+  # (deja tus exclusiones habituales)
 
 win:
   target:
     - target: nsis
       arch:
         - x64
-        - ia32   # si necesitas 32-bit, sino quítalo
   artifactName: "${productName}-Setup-${version}.${ext}"
 
 nsis:
