@@ -23,6 +23,7 @@ asarUnpack:
   - "node_modules/@serialport/**"
   - "node_modules/@serialport/bindings-cpp/**"
   - "node_modules/@serialport/bindings-interface/**"
+  - "node_modules/usb/**"
 
 # Publicación a GitHub
 publish:
