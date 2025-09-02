@@ -1,43 +1,56 @@
-appId: com.tuempresa.starposai.lpa
-productName: Starposai LPA
+# electron-builder.yml (propuesta)
 
-asar: true
-asarUnpack:
-  - "node_modules/serialport/**"
-  - "node_modules/@serialport/**"
+appId: com.starposai.lpa
+productName: Starposai LPA
 
 directories:
   output: dist
   buildResources: build
 
+# Qué archivos entran al paquete (no uses asarUnpack para 'src/**')
 files:
-  # 👉 incluye el código fuente que se ejecuta en producción
-  - "src/**/*"
-  - "resources/**/*"
-  - "ticket.html"          # si la usas
-  - "package.json"
-
-  # Excluye lo que NO quieras dentro del asar
-  - "!dist/**"
+  - package.json
+  - src/**            # tu app principal
+  - ticket.html
+  - scripts/**        # si los usas
+  - "!node_modules/.cache/**"
   - "!**/*.map"
-  - "!**/node_modules/.bin"
-  - "!**/tests?(-*)/**"
-  - "!**/*.ts"             # si no transpilas y solo usas .js
-  # (deja tus exclusiones habituales)
 
+asar: true
+
+# Solo desempaqueta módulos nativos. NO pongas 'src/**' aquí.
+asarUnpack:
+  - "node_modules/@serialport/**"
+  - "node_modules/@serialport/bindings-cpp/**"
+  - "node_modules/@serialport/bindings-interface/**"
+
+# Publicación a GitHub
+publish:
+  - provider: github
+    owner: IgorNSMD          # <— cámbialo si corresponde
+    repo: starposai-lpa      # <— cámbialo si corresponde
+    releaseType: release     # ← evita draft/pre-release
+    vPrefixedTagName: false  # usa "1.1.0" en lugar de "v1.1.0" (o pon true y usa 'v')
+
+# Windows / instalador
 win:
   target:
-    - target: nsis
-      arch:
-        - x64
-  artifactName: "${productName}-Setup-${version}.${ext}"
+    - nsis
+  artifactName: "Starposai-LPA-Setup-${version}.exe"
+  requestedExecutionLevel: asInvoker
 
 nsis:
   oneClick: true
   perMachine: false
+  allowElevation: true
   allowToChangeInstallationDirectory: false
+  deleteAppDataOnUninstall: false
 
-publish:
-  - provider: github
-    owner: IgorNSMD
-    repo: starposai-lpa
+# Opcional: evita recompilar nativos si ya hiciste electron-rebuild en postinstall
+npmRebuild: true
+buildDependenciesFromSource: false
+
+# Firma (si tienes cert) – opcional
+# win:
+#   certificateFile: path/to/cert.pfx
+#   certificatePassword: ${CSC_KEY_PASSWORD}
