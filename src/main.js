@@ -9,6 +9,11 @@ const express = require('express');
 const cors = require('cors');
 const { execFile, exec } = require('child_process');
 
+const { SerialPort } = require('serialport');
+const http = require('http');
+const net = require('net');
+const usb = require('usb');
+
 const APP_DIR = path.join(os.homedir(), 'AppData', 'Roaming', 'STARPOSAI'); // Windows
 fs.mkdirSync(APP_DIR, { recursive: true });
 const LOG_FILE = path.join(APP_DIR, 'lpa.log');
@@ -292,6 +297,74 @@ async function printHTMLSilent(html, deviceName, copies = 1, widthMm = 80) {
   win.destroy(); // no es async
 }
 
+// ESC p m t1 t2
+function escpPulse(pin=0,on=50,off=200){ return Buffer.from([0x1B,0x70,pin,on,off]); }
+
+async function openCash_TCP9100({ host, port=9100, pin=0, on=50, off=200 }) {
+  const payload = escpPulse(pin,on,off);
+
+  return await new Promise((resolve,reject)=>{
+    const s = net.createConnection({ host, port }, () => {
+      s.write(payload, err => {
+        if (err) return reject(err);
+        s.end(); resolve({ ok:true, method:'tcp9100', host, port });
+      });
+    });
+    s.setTimeout(4000, ()=>{ s.destroy(); reject(new Error('tcp_timeout')); });
+    s.on('error', reject);
+  });
+}
+
+function eposOpenCash_XML({ host, servicePath='/cgi-bin/epos/service.cgi', pin=0, on=50, off=200 }){
+  const xml =
+    `<?xml version="1.0" encoding="utf-8"?>
+    <epos-print xmlns="http://www.epson-pos.com/schemas/2011/03/epos-print">
+      <pulse drawer="${pin===0?1:2}" time="${on}" />
+    </epos-print>`;
+
+  const opts = {
+    host, port:80, path:servicePath, method:'POST',
+    headers:{ 'Content-Type':'text/xml', 'Content-Length':Buffer.byteLength(xml) }
+  };
+  return new Promise((resolve,reject)=>{
+    const req = http.request(opts, res=>{
+      let body=''; res.setEncoding('utf8');
+      res.on('data',ch=>body+=ch);
+      res.on('end',()=> resolve({ ok:true, method:'epos', host, status:res.statusCode, body }));
+    });
+    req.on('error',reject); req.write(xml); req.end();
+  });
+}
+
+async function openCash_Serial({ com='COM3', baudRate=9600, pin=0, on=50, off=200 }){
+  const payload = Buffer.from([0x1B,0x70,pin,on,off]);
+  const port = new SerialPort({ path: com, baudRate, autoOpen:false });
+
+  return await new Promise((resolve,reject)=>{
+    port.open(err=>{
+      if (err) return reject(err);
+      port.write(payload, wErr=>{
+        if (wErr) { try{port.close(()=>{})}catch{}; return reject(wErr); }
+        port.drain(()=> port.close(()=> resolve({ ok:true, method:'serial', com })));
+      });
+    });
+  });
+}
+
+// === Helpers locales (si ya los tienes, puedes reusar los tuyos) ===
+async function resolveTargetPrinterName(preferred) {
+const w = ensureWindow();
+const printers = await w.webContents.getPrintersAsync();
+if (!Array.isArray(printers) || printers.length === 0) return null;
+if (preferred && printers.some(p => p.name === preferred)) return preferred;
+const def = printers.find(p => p.isDefault)?.name;
+if (def) return def;
+try {
+  const sysDef = await getWindowsDefaultPrinterName?.();
+  if (sysDef) return sysDef;
+} catch {}
+return printers[0].name;
+}
 
 // ------------------------------
 // API HTTP (Express)
@@ -647,22 +720,6 @@ function setupServer() {
 
 
 
-  // === Helpers locales (si ya los tienes, puedes reusar los tuyos) ===
-  async function resolveTargetPrinterName(preferred) {
-  const w = ensureWindow();
-  const printers = await w.webContents.getPrintersAsync();
-  if (!Array.isArray(printers) || printers.length === 0) return null;
-  if (preferred && printers.some(p => p.name === preferred)) return preferred;
-  const def = printers.find(p => p.isDefault)?.name;
-  if (def) return def;
-  try {
-    const sysDef = await getWindowsDefaultPrinterName?.();
-    if (sysDef) return sysDef;
-  } catch {}
-  return printers[0].name;
-  }
-
-
 
   // ===============================
   // GET /cash/test
@@ -767,6 +824,229 @@ function setupServer() {
     }
   });
 
+
+    // ==============================
+  // POST /cash/open/network
+  // body:
+  //   {
+  //     mode: "tcp9100" | "epos",
+  //     host: string,              // IP o hostname (obligatorio)
+  //     port?: number,             // tcp9100: default 9100
+  //     servicePath?: string,      // epos: default "/cgi-bin/epos/service.cgi"
+  //     pin?: 0|1, on?: number, off?: number,
+  //     simulate?: boolean
+  //   }
+  // ==============================
+  srv.post('/cash/open/network', async (req, res) => {
+    try {
+      const b = req.body || {};
+      const mode = (b.mode || '').toLowerCase();
+      const host = String(b.host || '').trim();
+      const pin  = (Number(b.pin ?? 0) & 0xFF) || 0;
+      const on   = (Number(b.on  ?? 50) & 0xFF) || 50;
+      const off  = (Number(b.off ?? 200) & 0xFF) || 200;
+      const simulate = !!b.simulate;
+
+      if (!host) return res.status(400).json({ ok:false, error:'host_required' });
+      if (mode !== 'tcp9100' && mode !== 'epos') {
+        return res.status(400).json({ ok:false, error:'mode_invalid', detail:{ mode } });
+      }
+
+      // Simulación
+      if (simulate) {
+        logd('CASH_NET_SIM', { mode, host, pin, on, off });
+        return res.json({ ok:true, simulated:true, mode, host, pin, on, off });
+      }
+
+      let r;
+      if (mode === 'tcp9100') {
+        const port = Number(b.port || 9100);
+        r = await openCash_TCP9100({ host, port, pin, on, off });
+      } else {
+        const servicePath = String(b.servicePath || '/cgi-bin/epos/service.cgi');
+        r = await eposOpenCash_XML({ host, servicePath, pin, on, off });
+      }
+
+      return res.json({ ok:true, mode, host, pin, on, off, detail:r });
+    } catch (e) {
+      logd('CASH_NET_ERR', String(e));
+      return res.status(500).json({ ok:false, error:String(e) });
+    }
+  });
+
+  // Lista rápida de puertos serie disponibles (ayuda a cliente)
+  srv.get('/cash/serial/ports', async (_req, res) => {
+    try {
+      const list = await SerialPort.list();
+      // normalizamos campos más útiles
+      const out = list.map(p => ({
+        path: p.path,
+        friendlyName: p.friendlyName || p.manufacturer || null,
+        serialNumber: p.serialNumber || null,
+        vendorId: p.vendorId || null,
+        productId: p.productId || null,
+      }));
+      res.json({ ok:true, ports: out });
+    } catch (e) {
+      logd('SERIAL_LIST_ERR', String(e));
+      res.status(500).json({ ok:false, error:String(e) });
+    }
+  });
+
+  // ==============================
+  // POST /cash/open/serial
+  // body:
+  //   {
+  //     com: "COM3" (obligatorio),
+  //     baudRate?: number (default 9600),
+  //     pin?: 0|1, on?: number, off?: number,
+  //     simulate?: boolean
+  //   }
+  // ==============================
+  srv.post('/cash/open/serial', async (req, res) => {
+    try {
+      const b = req.body || {};
+      const com = String(b.com || '').trim();
+      const baudRate = Number(b.baudRate || 9600);
+      const pin  = (Number(b.pin ?? 0) & 0xFF) || 0;
+      const on   = (Number(b.on  ?? 50) & 0xFF) || 50;
+      const off  = (Number(b.off ?? 200) & 0xFF) || 200;
+      const simulate = !!b.simulate;
+
+      if (!com) return res.status(400).json({ ok:false, error:'com_required' });
+
+      if (simulate) {
+        logd('CASH_SERIAL_SIM', { com, baudRate, pin, on, off });
+        return res.json({ ok:true, simulated:true, com, baudRate, pin, on, off });
+      }
+
+      const r = await openCash_Serial({ com, baudRate, pin, on, off });
+      return res.json({ ok:true, com, baudRate, pin, on, off, detail:r });
+    } catch (e) {
+      logd('CASH_SERIAL_ERR', String(e));
+      res.status(500).json({ ok:false, error:String(e) });
+    }
+  });
+
+  // ==============================
+  // GET /cash/ui  → página de prueba
+  // ==============================
+  srv.get('/cash/ui', (_req, res) => {
+      const html = `<!doctype html>
+  <html lang="es"><meta charset="utf-8"/>
+  <title>Prueba de Cajón - LPA</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:24px;line-height:1.45;}
+    fieldset{margin:16px 0;padding:12px;border-radius:10px}
+    input,select,button{font-size:14px;padding:6px}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+  </style>
+  <h2>Prueba de apertura de cajón</h2>
+  <p>Esta página llama a los endpoints del agente local (LPA).</p>
+
+  <fieldset>
+    <legend><b>1) Driver local (WritePrinter / printcmd)</b></legend>
+    <div class="row">
+      <label>Impresora (opcional):</label>
+      <input id="p_local" placeholder="Nombre exacto (o vacío para predeterminada)" size="40"/>
+    </div>
+    <div class="row">
+      <label>PIN</label><select id="pin_l"><option>0</option><option>1</option></select>
+      <label>ON</label><input id="on_l" type="number" min="0" max="255" value="50" style="width:80px"/>
+      <label>OFF</label><input id="off_l" type="number" min="0" max="255" value="200" style="width:80px"/>
+      <label>Estrategia</label>
+      <select id="stg_l"><option value="powershell">powershell</option><option value="printcmd">printcmd</option></select>
+      <button onclick="openLocal()">Abrir (local)</button>
+    </div>
+    <pre id="out_local" class="mono"></pre>
+  </fieldset>
+
+  <fieldset>
+    <legend><b>2) Red (TCP9100 o Epson ePOS-XML)</b></legend>
+    <div class="row">
+      <label>Modo</label>
+      <select id="mode_n"><option value="tcp9100">TCP 9100 (Raw)</option><option value="epos">EPSON ePOS-XML</option></select>
+      <label>Host/IP</label><input id="host_n" placeholder="192.168.1.50" size="16"/>
+      <label>Puerto</label><input id="port_n" type="number" value="9100" style="width:90px"/>
+      <label>servicePath (ePOS)</label><input id="path_n" value="/cgi-bin/epos/service.cgi" size="28"/>
+    </div>
+    <div class="row">
+      <label>PIN</label><select id="pin_n"><option>0</option><option>1</option></select>
+      <label>ON</label><input id="on_n" type="number" min="0" max="255" value="50" style="width:80px"/>
+      <label>OFF</label><input id="off_n" type="number" min="0" max="255" value="200" style="width:80px"/>
+      <button onclick="openNet()">Abrir (red)</button>
+    </div>
+    <pre id="out_net" class="mono"></pre>
+  </fieldset>
+
+  <fieldset>
+    <legend><b>3) Serial (COM)</b></legend>
+    <div class="row">
+      <label>Puerto</label>
+      <input id="com_s" placeholder="COM3" style="width:120px"/>
+      <label>Baudios</label><input id="baud_s" type="number" value="9600" style="width:100px"/>
+    </div>
+    <div class="row">
+      <label>PIN</label><select id="pin_s"><option>0</option><option>1</option></select>
+      <label>ON</label><input id="on_s" type="number" min="0" max="255" value="50" style="width:80px"/>
+      <label>OFF</label><input id="off_s" type="number" min="0" max="255" value="200" style="width:80px"/>
+      <button onclick="openSerial()">Abrir (serial)</button>
+      <button onclick="listSerial()">Listar puertos</button>
+    </div>
+    <pre id="out_serial" class="mono"></pre>
+  </fieldset>
+
+  <script>
+  async function post(url, body){
+    const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const t = await r.text(); try{return JSON.parse(t);}catch{ return {ok:false,error:'bad_json',raw:t} }
+  }
+  function show(id, data){ document.getElementById(id).textContent = JSON.stringify(data,null,2) }
+
+  async function openLocal(){
+    const body = {
+      printerName: document.getElementById('p_local').value || null,
+      pin: Number(document.getElementById('pin_l').value),
+      on:  Number(document.getElementById('on_l').value),
+      off: Number(document.getElementById('off_l').value),
+      strategy: document.getElementById('stg_l').value
+    };
+    const r = await post('/cash/open', body);
+    show('out_local', r);
+  }
+  async function openNet(){
+    const body = {
+      mode: document.getElementById('mode_n').value,
+      host: document.getElementById('host_n').value,
+      port: Number(document.getElementById('port_n').value),
+      servicePath: document.getElementById('path_n').value,
+      pin: Number(document.getElementById('pin_n').value),
+      on:  Number(document.getElementById('on_n').value),
+      off: Number(document.getElementById('off_n').value)
+    };
+    const r = await post('/cash/open/network', body);
+    show('out_net', r);
+  }
+  async function openSerial(){
+    const body = {
+      com: document.getElementById('com_s').value,
+      baudRate: Number(document.getElementById('baud_s').value),
+      pin: Number(document.getElementById('pin_s').value),
+      on:  Number(document.getElementById('on_s').value),
+      off: Number(document.getElementById('off_s').value)
+    };
+    const r = await post('/cash/open/serial', body);
+    show('out_serial', r);
+  }
+  async function listSerial(){
+    const r = await fetch('/cash/serial/ports').then(x=>x.json()).catch(e=>({ok:false,error:String(e)}));
+    show('out_serial', r);
+  }
+  </script>
+  </html>`;
+      res.type('html').send(html);
+    });
 
 
   srv.listen(PORT, '127.0.0.1', () => log.info(`LPA listening on http://127.0.0.1:${PORT}`));
